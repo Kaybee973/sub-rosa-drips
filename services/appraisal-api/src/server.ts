@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Sub Rosa contributors
+import { createLogger } from "@sub-rosa/logging";
+const diagnostics = createLogger("appraisal-api.server");
+import { normalizeError, publicErrorMessage } from "@sub-rosa/logging/errors";
 // x402-gated appraisal API.
 //
 // `POST /appraise` is payment-protected. An agent that calls it without payment
@@ -33,19 +37,11 @@ import {
 import { ExactStellarScheme as FacilitatorStellarScheme } from "@x402/stellar/exact/facilitator";
 import { ExactStellarScheme as ServerStellarScheme } from "@x402/stellar/exact/server";
 
-import { appraise, AppraisalInputError, parseAppraisalRequest } from "./appraisal.js";
+import { appraise, AppraisalInputError, buildAppraisalQuote, MAX_APPRAISAL_BODY_BYTES, parseAppraisalRequest } from "./appraisal.js";
+import { takeAppraisalRequestBody } from "./body-limit.js";
 import type { AppraisalServerConfig } from "./config.js";
 
 const APPRAISE_ROUTE = "POST /appraise";
-
-function readBody(req: http.IncomingMessage): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    req.on("data", (c) => chunks.push(c as Buffer));
-    req.on("end", () => resolve(Buffer.concat(chunks)));
-    req.on("error", reject);
-  });
-}
 
 /** Minimal HTTPAdapter over a Node request + already-read body. */
 function makeAdapter(
@@ -161,7 +157,14 @@ export async function buildAppraisalServer(
         });
       }
 
-      const rawBody = await readBody(req);
+      const taken = await takeAppraisalRequestBody(req, MAX_APPRAISAL_BODY_BYTES);
+      if ("status" in taken) {
+        // Fail closed before JSON parsing and before any payment offer.
+        send(res, taken.status, {}, taken.body);
+        res.on("finish", () => req.destroy());
+        return;
+      }
+      const rawBody = taken.raw;
       let parsedBody: unknown = undefined;
       if (rawBody.length > 0) {
         try {
@@ -169,6 +172,9 @@ export async function buildAppraisalServer(
         } catch {
           return send(res, 400, {}, { error: "invalid JSON body" });
         }
+      } else if (method === "POST" && url.pathname === "/appraise") {
+        // Empty POST bodies are a stable 400 — never a 402, never a settlement.
+        return send(res, 400, {}, { error: "Invalid appraisal request" });
       }
 
       const adapter = makeAdapter(req, url, parsedBody);
@@ -193,10 +199,18 @@ export async function buildAppraisalServer(
       // malformed body never costs the caller.
       let body: unknown;
       try {
-        body = { appraisal: appraise(parseAppraisalRequest(parsedBody)) };
+        body = {
+          appraisal: appraise(parseAppraisalRequest(parsedBody)),
+          quote: buildAppraisalQuote({
+            asset: config.asset,
+            price: config.price,
+            destination: config.payTo,
+            nowSeconds: Math.floor(Date.now() / 1000),
+          }),
+        };
       } catch (e) {
         if (e instanceof AppraisalInputError) {
-          return send(res, 400, {}, { error: e.message });
+          return send(res, 400, {}, { error: "Invalid appraisal request" });
         }
         throw e;
       }
@@ -226,7 +240,8 @@ export async function buildAppraisalServer(
         },
       );
     } catch (err) {
-      send(res, 500, {}, { error: err instanceof Error ? err.message : String(err) });
+      diagnostics.error("request-failed", normalizeError(err));
+      send(res, 500, {}, { error: publicErrorMessage(err) });
     }
   });
 }
